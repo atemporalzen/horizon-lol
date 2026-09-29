@@ -40,7 +40,7 @@ horizon/
 ├── README.md                     this file
 └── html/
     ├── amaze.html                attacker entry page (config + manager logic)
-    ├── lna-bypass.html           LNA navigation bypass PoC (standalone, no server needed)
+    ├── lna-bypass.html           LNA navigation bypass (Singularity-integrated, same CONFIG as amaze.html)
     ├── payload.js              attack-frame logic (rebind loop, exfil dispatch)
     └── payloads/
         ├── aws-metadata-exfil.js   exfil rebound response to a webhook
@@ -64,6 +64,14 @@ filename is fixed by the server build, do not rename.
 | Rebind retry interval             | `html/amaze.html`                      | `CONFIG.interval`                 |
 | iframe vs fetch attack method     | `html/amaze.html`                      | `CONFIG.attackMethod`             |
 | Which payload script to dispatch  | `html/amaze.html`                      | `CONFIG.attackPayload`            |
+| **LNA bypass: target path**       | `html/lna-bypass.html`                 | `CONFIG.targetPath`               |
+| LNA bypass: target IP             | `html/lna-bypass.html`                 | `CONFIG.targetHostIPAddress`      |
+| LNA bypass: target port           | `html/lna-bypass.html`                 | `CONFIG.targetPort`               |
+| LNA bypass: attacker server IP    | `html/lna-bypass.html`                 | `CONFIG.attackHostIPAddress`      |
+| LNA bypass: attacker domain       | `html/lna-bypass.html`                 | `CONFIG.attackHostDomain`         |
+| LNA bypass: rebinding strategy    | `html/lna-bypass.html`                 | `CONFIG.rebindingStrategy`        |
+| LNA bypass: poll interval         | `html/lna-bypass.html`                 | `CONFIG.interval`                 |
+| LNA bypass: payload               | `html/lna-bypass.html`                 | `CONFIG.attackPayload`            |
 | Where exfil data is POSTed        | `html/payloads/aws-metadata-exfil.js`| `EXFILTRATION_URL`                |
 | Where scraper data is POSTed      | `html/payloads/lna-dom-scraper.js`   | `EXFILTRATION_URL`                |
 | Scraper crawl depth               | `html/payloads/lna-dom-scraper.js`   | `MAX_CRAWL_DEPTH`, `MAX_PAGES`    |
@@ -235,7 +243,13 @@ Both iframes that need it already carry `allow="local-network-access *"`:
 These attributes are harmless if the server-side token isn't set yet, so
 you can roll out client and server independently.
 
-## LNA Navigation Bypass (new research)
+## LNA Navigation Bypass
+
+`html/lna-bypass.html` — **integrated with Singularity's DNS rebinding
+server.** Uses the same CONFIG block, subdomain encoding, and payload
+dispatch as `amaze.html`. The key difference is the attack method:
+top-level navigation (`window.open` + `popup.location`) instead of
+`fetch`/`iframe`, which bypasses Chrome/Firefox Local Network Access (LNA).
 
 Chrome and Firefox now ship **Local Network Access (LNA)**: even a same-origin
 `fetch()` is blocked if the resolved IP is more local than the requesting
@@ -244,32 +258,42 @@ rely on `fetch` or `XMLHttpRequest` to read the rebound response.
 
 **But navigations are not guarded.** Top-level navigations (`window.open`,
 `location =`, `<a>` clicks) still resolve DNS and connect freely — LNA only
-gates subresource requests. This gives us a full bypass:
+gates subresource requests. This gives us a full bypass.
 
 ### How it works
 
-1. **Attacker serves page** — victim visits `attacker.com` (your IP). You
-   serve `lna-bypass.html`, which opens a popup via `window.open("/", "popup")`.
-2. **Poll for rebind** — the page loops `fetch("/", {cache:"reload"})`. While
+1. **Redirect to attack subdomain** — `lna-bypass.html` builds the Singularity
+   encoded subdomain URL (`s-ATTACKERIP-TARGETIP-RAND-STRATEGY-e.domain:port`)
+   and redirects itself there. This is required so the page and popup share
+   the same origin, enabling `popup.document` access after rebind.
+2. **Open popup** — on click, opens `window.open("/", "lna_popup")` on the
+   attack subdomain (same origin as the page). DNS still resolves to attacker IP.
+3. **Poll for rebind** — the page loops `fetch("/", {cache:"reload"})`. While
    DNS still points to the attacker IP, fetches succeed normally.
-3. **Flip DNS** — you repoint `attacker.com` to `127.0.0.1` (or `192.168.x.x`,
-   `169.254.169.254`, any private/loopback target).
-4. **LNA kills fetch** — after the browser's ~60s DNS cache expires, the next
-   `fetch("/")` resolves to a local IP. LNA blocks it with a `TypeError`.
-   The page detects this as proof the rebind succeeded.
-5. **Navigate the popup** — `popup.location = "/"` is a top-level navigation,
-   which LNA does not block. The popup navigates to the target's `/`.
-6. **Read the response** — the popup is still "same origin" (same
+4. **Singularity flips DNS** — the encoded subdomain tells Singularity to
+   serve the attacker IP first, then flip to the target IP (per the chosen
+   `rebindingStrategy`).
+5. **LNA kills fetch** — after the DNS flip, `fetch("/")` resolves to the
+   target (a private/loopback IP). LNA blocks it with a `TypeError`. The page
+   detects this as proof the rebind succeeded.
+6. **Navigate the popup** — `popup.location = CONFIG.targetPath` is a
+   top-level navigation, which LNA does not block. The popup loads the target.
+7. **Read the response** — the popup is still "same origin" (same
    scheme+host+port as the opener), so `popup.document.documentElement.outerHTML`
    reads the target's full response. **CORS bypassed.**
+8. **Dispatch to payload** — the response body is passed to
+   `Registry[CONFIG.attackPayload].attack()`, same as amaze.html. Defaults
+   to `AWS Metadata Exfil`.
 
 ### What you get
 
 - Full DOM read of any HTTP service on `127.0.0.1`, `192.168.x.x`,
   `10.x.x.x`, `169.254.169.254` (AWS IMDS), or any other private IP — from
   a webpage the victim merely clicked on.
-- No special server binary needed. Any DNS rebinding setup that can flip an
-  A record works.
+- Works against stock Chrome/Firefox with no server modifications and no
+  Origin Trial tokens.
+- Uses the same Singularity DNS server, CONFIG fields, and payload scripts
+  as `amaze.html` — no separate infrastructure.
 - Works in current Chrome and Firefox (as of 2025). The LNA spec explicitly
   exempts navigations.
 
@@ -277,16 +301,25 @@ gates subresource requests. This gives us a full bypass:
 
 - Requires a user gesture (click) to open the popup. Popup blockers will
   kill it without one.
-- ~60s wait for the browser's DNS cache to expire. Not instant.
-- Only reads the initial page load. For multi-step interaction, combine with
-  the `Hook and Control` payload or script further navigations from the popup
-  reference.
+- ~60s wait for the browser's DNS cache to expire (with `fs` strategy and
+  `interval: '20'`). Not instant.
+- Only reads the initial page load. For multi-step interaction, use the
+  `LNA DOM Scraper` payload (which crawls via the popup reference) or
+  the `Hook and Control` payload.
 - The popup is visible (though offscreen and tiny). A very attentive user
   might notice it in the taskbar.
 
-### File
+### vs. amaze.html
 
-`html/lna-bypass.html` — standalone PoC. No Singularity binary needed.
+| | `amaze.html` | `lna-bypass.html` |
+|---|---|---|
+| **Attack method** | `fetch`/`iframe` inside attack frame | `window.open` + top-level navigation |
+| **LNA compatible** | No (blocked by LNA) | Yes (navigations exempt from LNA) |
+| **Needs Origin Trial** | Yes, for LNA targets | No |
+| **Rebind detection** | `payload.js` checks response headers/body | `fetch()` TypeError = LNA block |
+| **Response read** | `fetch()` response body | `popup.document.documentElement.outerHTML` |
+| **Uses Singularity DNS** | Yes | Yes (same subdomain encoding) |
+| **Payload dispatch** | Via `attack()` in Registry | Via `attack()` in Registry (same) |
 
 ### vs. the Origin-Trial bypass (existing)
 
@@ -302,35 +335,6 @@ Chrome/Firefox with no server modifications and no trial tokens. It's the
 strictly better approach for new attacks unless you need `fetch`-level
 control (e.g. custom headers, POST bodies), in which case the Origin-Trial
 path is still needed.
-
-### PoC code (condensed)
-
-```html
-<p id="msg">Click once</p>
-<script>
-  if (name === "popup") msg.innerText = "Wait ~60s...";
-  onclick = async () => {
-    onclick = null;
-    w = window.open("/", "popup", "width=1,height=1,top=9999,left=9999");
-
-    msg.innerText = "Wait ~60s...";
-    while (true) {
-      try {
-        const text = await fetch("/", { cache: "reload" }).then(r => r.text());
-      } catch (e) {
-        break;  // LNA error means we rebinded successfully
-      }
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    msg.innerText = "Rebind successful! Check console";
-
-    w.location = "/";  // top-level navigation still works
-    setTimeout(() => {
-      console.log(w.document.documentElement.outerHTML);  // same-origin read
-    }, 2000);
-  }
-</script>
-```
 
 ## What was stripped from the upstream/fork
 
