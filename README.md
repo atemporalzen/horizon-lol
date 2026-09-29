@@ -2,6 +2,8 @@
 
 Minimal DNS-rebinding attack against a single hardcoded target. See [WIKI.md](WIKI.md) for the deep dive.
 
+**New:** LNA Navigation Bypass — DNS rebinding that bypasses Chrome/Firefox Local Network Access using `window.open` + navigation instead of `fetch`. No server binary needed. See [WIKI.md → LNA Navigation Bypass](WIKI.md#lna-navigation-bypass-new-research).
+
 ## Quick start
 
 1. **Clone**
@@ -33,3 +35,13 @@ Minimal DNS-rebinding attack against a single hardcoded target. See [WIKI.md](WI
    ```
 
 Then have the victim browser visit `http://rebinder.az2.website/amaze.html`.
+
+## LNA Navigation Bypass (no server needed)
+
+If Chrome's LNA is blocking your `fetch`-based rebinding, use the navigation bypass instead:
+
+1. **Serve `html/lna-bypass.html`** from any HTTP server on your attacker domain.
+2. **Set up DNS flipping** — any mechanism that repoints your domain from attacker IP → target IP (e.g. `127.0.0.1`, `192.168.x.x`).
+3. **Victim clicks once**, waits ~60s for DNS cache to expire. The page detects the rebind via LNA blocking `fetch`, then reads the target through a navigated popup window.
+
+No Singularity binary, no Origin-Trial tokens, no Go toolchain. See [WIKI.md](WIKI.md#lna-navigation-bypass-new-research) for the full explanation.
