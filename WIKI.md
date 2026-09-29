@@ -44,7 +44,8 @@ horizon/
     ├── payload.js              attack-frame logic (rebind loop, exfil dispatch)
     └── payloads/
         ├── aws-metadata-exfil.js   exfil rebound response to a webhook
-        └── hook-and-control.js     open a WS back-channel for live browsing
+        ├── hook-and-control.js     open a WS back-channel for live browsing
+        └── lna-dom-scraper.js      crawl + scrape DOM via navigation bypass popup
 ```
 
 The Go binary's `/soopayload.html` template is what loads `payload.js` — its
@@ -64,7 +65,10 @@ filename is fixed by the server build, do not rename.
 | iframe vs fetch attack method     | `html/amaze.html`                      | `CONFIG.attackMethod`             |
 | Which payload script to dispatch  | `html/amaze.html`                      | `CONFIG.attackPayload`            |
 | Where exfil data is POSTed        | `html/payloads/aws-metadata-exfil.js`| `EXFILTRATION_URL`                |
+| Where scraper data is POSTed      | `html/payloads/lna-dom-scraper.js`   | `EXFILTRATION_URL`                |
+| Scraper crawl depth               | `html/payloads/lna-dom-scraper.js`   | `MAX_CRAWL_DEPTH`, `MAX_PAGES`    |
 | Switch to live WS browsing        | `html/amaze.html`                      | `CONFIG.attackPayload = 'Hook and Control'` |
+| Switch to DOM scraper (LNA bypass)| `html/lna-bypass.html`                 | `CONFIG.attackPayload = 'LNA DOM Scraper'` |
 | Add a brand-new payload type      | new file in `html/payloads/`         | register into `Registry["Name"]`  |
 
 > **Single source of truth for the target path.** In the upstream code,
